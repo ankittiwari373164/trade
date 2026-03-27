@@ -1,15 +1,9 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "server.js",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "server.js"
-    }
+  "builds": [{ "src": "server.js", "use": "@vercel/node" }],
+  "routes": [{ "src": "/(.*)", "dest": "server.js" }],
+  "crons": [
+    { "path": "/api/refresh", "schedule": "*/3 3-10 * * 1-5" },
+    { "path": "/api/load-history", "schedule": "0 3 * * 1-5" }
   ]
 }

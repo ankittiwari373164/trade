@@ -925,6 +925,17 @@ async function init() {
   console.log(`\n[Ready] ✅ ${istStr()} | ${phase} | ${lockedPredictions.filter(p=>p.action!=='HOLD').length} active predictions`);
 }
 
+// Auto-init on first request (Vercel serverless)
+let initialized = false;
+const originalHandler = app.handle.bind(app);
+app.handle = async (req, res, next) => {
+  if (!initialized) {
+    initialized = true;
+    try { await init(); } catch(e) { console.error('[Init]', e.message); }
+  }
+  originalHandler(req, res, next);
+};
+
 if (require.main === module) {
   app.listen(PORT, init);
 }
