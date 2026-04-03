@@ -263,6 +263,22 @@ let dataStore = {
 let mtfStocks = [];
 const companyNames = {};
 
+// ── Request-time lazy refresh (replaces */3 cron on Vercel Hobby) ──
+// On each frontend poll to /api/mtf/live or /api/quotes,
+// if data is stale (>2 min) and market is open → refresh in background
+const STALE_MS = 2 * 60 * 1000; // 2 minutes
+let _refreshing = false;
+function isStale() {
+  if (!dataStore.lastUpdated) return true;
+  return (Date.now() - new Date(dataStore.lastUpdated).getTime()) > STALE_MS;
+}
+function maybeRefresh() {
+  if (_refreshing || !isOpen() || !isStale()) return;
+  _refreshing = true;
+  mainRefresh().finally(() => { _refreshing = false; });
+}
+
+
 // ══════════════════════════════════════════════════════════════
 // GROWW MOST-TRADED SCRAPE
 // ══════════════════════════════════════════════════════════════
@@ -827,10 +843,14 @@ app.get('/api/status', (_, res) => {
   });
 });
 
-app.get('/api/quotes', (_, res) => res.json({ quotes:dataStore.quotes, lastUpdated:dataStore.lastUpdated }));
+app.get('/api/quotes', (_, res) => {
+  maybeRefresh(); // trigger background refresh if stale
+  res.json({ quotes:dataStore.quotes, lastUpdated:dataStore.lastUpdated });
+});
 
 // ★ MAIN PREDICTION ENDPOINT
 app.get('/api/mtf/live', (req, res) => {
+  maybeRefresh(); // trigger background refresh if stale
   const { action, limit=50 } = req.query;
   let preds = [...lockedPredictions];
 
