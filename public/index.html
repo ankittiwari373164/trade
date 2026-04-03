@@ -214,6 +214,7 @@ header{position:sticky;top:0;z-index:100;display:flex;align-items:center;gap:12p
 
 <div class="tabs">
   <div class="tab active" onclick="showTab('preds',this)">📊 Predictions</div>
+  <div class="tab" onclick="showTab('mtf',this)">🔥 MTF Stocks</div>
   <div class="tab" onclick="showTab('chart',this)">📈 Chart</div>
   <div class="tab" onclick="showTab('quotes',this)">💹 Live Quotes</div>
 </div>
@@ -239,6 +240,41 @@ header{position:sticky;top:0;z-index:100;display:flex;align-items:center;gap:12p
 
   <div id="predGrid" class="pred-grid">
     <div class="loading" style="grid-column:1/-1"><div class="spin"></div> Loading predictions...</div>
+  </div>
+</div>
+
+<!-- ═══ MTF STOCKS ═══ -->
+<div id="pane-mtf" class="pane">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+    <div>
+      <div style="font-size:13px;font-weight:800;margin-bottom:2px">🔥 Groww MTF Most Traded Stocks</div>
+      <div style="font-size:9px;color:var(--muted)">Source: groww.in/stocks/mtf/most-traded — scraped live every 30 min. Predictions from 9:15 vs 9:25 momentum engine.</div>
+    </div>
+    <span id="mtfCount" style="font-size:9px;color:var(--muted)">—</span>
+  </div>
+  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden">
+    <div style="overflow-x:auto">
+      <table class="qtbl">
+        <thead><tr>
+          <th style="text-align:left">Company</th>
+          <th style="text-align:left">NSE Code</th>
+          <th>LTP</th>
+          <th>Day Chg%</th>
+          <th>Haircut%</th>
+          <th>Circuit</th>
+          <th>Prediction</th>
+          <th>Target</th>
+          <th>Stop</th>
+          <th>Conf</th>
+          <th>Action</th>
+        </tr></thead>
+        <tbody id="mtfBody">
+          <tr><td colspan="11" style="text-align:center;padding:25px;color:var(--muted)">
+            <div class="loading"><div class="spin"></div> Loading MTF stocks...</div>
+          </td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </div>
 
@@ -281,11 +317,95 @@ header{position:sticky;top:0;z-index:100;display:flex;align-items:center;gap:12p
 
 <script>
 // ══════════════════════════════════════════════════════════════
-const API = 'https://trade-gamma-six.vercel.app';
+// Auto-detect API base — works locally AND on Vercel
+const API = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? `http://${window.location.hostname}:${window.location.port || 3001}`
+  : window.location.origin; // on Vercel: uses same domain
 let allPreds=[], allQuotes={};
 let predFilter='ALL', chartSym='RELIANCE', chartTF=5;
 let chart=null, candleSeries=null;
 const prevPx={};
+
+// ══════════════════════════════════════════════════════════════
+// MTF STOCKS
+// ══════════════════════════════════════════════════════════════
+let allMTF = [];
+
+async function fetchMTF() {
+  try {
+    const r = await fetch(`${API}/api/mtf/stocks`);
+    const d = await r.json();
+    allMTF = d.stocks || [];
+    document.getElementById('mtfCount').textContent = `${allMTF.length} stocks`;
+    renderMTF();
+  } catch(e) { console.error('MTF:', e.message); }
+}
+
+function renderMTF() {
+  const tbody = document.getElementById('mtfBody');
+  if (!allMTF.length) {
+    tbody.innerHTML='<tr><td colspan="11" style="text-align:center;padding:25px;color:var(--muted)">No MTF data — refresh to load</td></tr>';
+    return;
+  }
+
+  // Sort by |dayChangePct| descending — biggest movers first
+  const sorted = [...allMTF].sort((a,b) => Math.abs(b.dayChangePct)-Math.abs(a.dayChangePct));
+
+  tbody.innerHTML = sorted.map(s => {
+    const p     = s.prediction;
+    const cc    = s.dayChangePct>=0?'pos':'neg';
+    const gUrl  = s.growwUrl || `https://groww.in/stocks/${s.searchId||s.symbol.toLowerCase()}`;
+    const buyUrl  = p?.growwBuyUrl  || `${gUrl}?action=buy`;
+    const sellUrl = p?.growwSellUrl || `${gUrl}?action=sell`;
+
+    // Prediction columns
+    const actionBadge = p && p.action!=='HOLD'
+      ? `<span class="badge badge-${p.action}">${p.action}</span>`
+      : '<span style="color:var(--muted);font-size:9px">—</span>';
+    const targetCell = p?.targetPrice
+      ? `<span style="color:${p.action==='BUY'?'var(--green)':'var(--red)'}">₹${p.targetPrice}</span>`
+      : '—';
+    const stopCell = p?.stopLossPrice
+      ? `<span style="color:var(--red)">₹${p.stopLossPrice}</span>`
+      : '—';
+    const confCell = p?.confidence
+      ? `<span style="color:${p.confidence>=70?'var(--green)':p.confidence>=55?'var(--yellow)':'var(--red)'}">${p.confidence}%</span>`
+      : '—';
+
+    const circuitStr = s.circuitLow && s.circuitHigh
+      ? `<span style="color:var(--green)">↑₹${s.circuitHigh.toFixed(1)}</span> <span style="color:var(--red)">↓₹${s.circuitLow.toFixed(1)}</span>`
+      : '—';
+
+    // Dev10 chip if prediction exists
+    const dev10Chip = p?.dev10!=null
+      ? `<span style="font-size:8px;color:${p.dev10>=0?'var(--green)':'var(--red)'};margin-left:4px">${p.dev10>=0?'▲':'▼'}${Math.abs(p.dev10).toFixed(1)}% 10m</span>`
+      : '';
+
+    // Action buttons
+    const actionBtns = p?.action==='BUY'
+      ? `<a href="${buyUrl}"  target="_blank" class="gbtn gbtn-buy"  style="font-size:9px;padding:4px 8px">🟢 BUY</a>`
+      : p?.action==='SELL'
+      ? `<a href="${sellUrl}" target="_blank" class="gbtn gbtn-sell" style="font-size:9px;padding:4px 8px">🔴 SELL</a>`
+      : `<a href="${gUrl}" target="_blank" class="gbtn gbtn-chart" style="font-size:9px;padding:4px 8px">📊 View</a>`;
+
+    return `<tr class="qrow" onclick="selectSym('${s.symbol}')">
+      <td style="text-align:left;max-width:160px">
+        <div style="font-weight:800;font-size:11px;color:var(--blue)">${s.companyName||s.shortName||s.symbol}</div>
+        <div style="font-size:8px;color:var(--muted)">Haircut: ${(s.haircut||0).toFixed(1)}%</div>
+      </td>
+      <td style="text-align:left;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text)">${s.symbol}</td>
+      <td>₹${(s.ltp||0).toFixed(2)}</td>
+      <td class="${cc}" style="font-weight:700">${s.dayChangePct>=0?'+':''}${(s.dayChangePct||0).toFixed(2)}%${dev10Chip}</td>
+      <td style="color:var(--yellow)">${(s.haircut||0).toFixed(1)}%</td>
+      <td style="font-size:9px">${circuitStr}</td>
+      <td>${actionBadge}</td>
+      <td style="font-size:11px">${targetCell}</td>
+      <td style="font-size:11px">${stopCell}</td>
+      <td style="font-size:11px">${confCell}</td>
+      <td>${actionBtns}</td>
+    </tr>`;
+  }).join('');
+}
 
 // ══════════════════════════════════════════════════════════════
 // FETCH
@@ -334,7 +454,7 @@ async function fetchQuotes() {
 async function refreshAll() {
   document.getElementById('wsDot').className='dot';
   document.getElementById('statusTxt').textContent='Refreshing...';
-  await Promise.all([fetchStatus(), fetchPreds(), fetchQuotes()]);
+  await Promise.all([fetchStatus(), fetchPreds(), fetchQuotes(), fetchMTF()]);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -541,8 +661,10 @@ function buildSymBtns() {
 
 function selectSym(sym) {
   chartSym = sym;
-  document.querySelectorAll('.sbtn').forEach(b=>b.classList.toggle('active',b.textContent===sym));
-  showTab('chart', document.querySelector('.tab:nth-child(2)'));
+  document.querySelectorAll('.sbtn').forEach(b=>b.classList.toggle('active',b.textContent.trim()===sym));
+  // Find chart tab by text content — safe regardless of tab order
+  const chartTab = [...document.querySelectorAll('.tab')].find(t=>t.textContent.includes('Chart'));
+  showTab('chart', chartTab);
   loadChart();
 }
 
@@ -633,6 +755,7 @@ function showTab(id, btn) {
   document.getElementById(`pane-${id}`)?.classList.add('active');
   if (btn) btn.classList.add('active');
   if (id==='chart') { if(!chart) setTimeout(()=>{initChart();loadChart();},80); }
+  if (id==='mtf')   { renderMTF(); }
 }
 
 // ══════════════════════════════════════════════════════════════
