@@ -19,7 +19,7 @@ require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
 const axios   = require('axios');
-// node-cron not used on Vercel — cron jobs run via /api/cron/* endpoints (see vercel.json)
+const cron    = require('node-cron');
 const path    = require('path');
 
 const app = express();
@@ -47,9 +47,13 @@ const GHDRS = {
 };
 const GROWW_BASE = 'https://api.groww.in/v1';
 
-// Fallback — used ONLY if Groww MTF scrape fails completely
+// Watchlist — Groww most-traded (NSE CASH)
 const BASE_STOCKS = [
-  'RELIANCE','TCS','INFY','HDFCBANK','ICICIBANK','SBIN','BAJFINANCE',
+  'RELIANCE','TCS','INFY','HDFCBANK','ICICIBANK',
+  'SBIN','WIPRO','BAJFINANCE','TATAMOTORS','ETERNAL',
+  'HCLTECH','TECHM','MAZDOCK','RVNL','IDFCFIRSTB',
+  'ADANIENT','HINDCOPPER','NATCOPHARM','MOREPENLAB','IRFC',
+  'AXISBANK','KOTAKBANK','LT','MARUTI','SUNPHARMA',
 ];
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -263,122 +267,45 @@ let dataStore = {
 let mtfStocks = [];
 const companyNames = {};
 
-// ── Request-time lazy refresh (replaces */3 cron on Vercel Hobby) ──
-// On each frontend poll to /api/mtf/live or /api/quotes,
-// if data is stale (>2 min) and market is open → refresh in background
-const STALE_MS = 2 * 60 * 1000; // 2 minutes
-let _refreshing = false;
-function isStale() {
-  if (!dataStore.lastUpdated) return true;
-  return (Date.now() - new Date(dataStore.lastUpdated).getTime()) > STALE_MS;
-}
-function maybeRefresh() {
-  if (_refreshing || !isOpen() || !isStale()) return;
-  _refreshing = true;
-  mainRefresh().finally(() => { _refreshing = false; });
-}
-
-
 // ══════════════════════════════════════════════════════════════
 // GROWW MOST-TRADED SCRAPE
 // ══════════════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════════════
-// GROWW MTF MOST-TRADED SCRAPER
-// Exact implementation from the Python script that works:
-//   url = "https://groww.in/stocks/mtf/most-traded"
-//   data["props"]["pageProps"]["mbgStocks"]
-// Each stock has:
-//   company: { nseScriptCode, companyName, companyShortName, searchId, mtfHaircut, isin }
-//   stats:   { ltp, high, low, close, dayChange, dayChangePerc }
-// ══════════════════════════════════════════════════════════════
 async function fetchGrowwMostTraded() {
-  console.log('[MTF] Scraping https://groww.in/stocks/mtf/most-traded ...');
   try {
-    const r = await axios.get('https://groww.in/stocks/mtf/most-traded', {
-      timeout: 15000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0',
-        'Accept':     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
+    const r = await axios.get('https://groww.in/v1/api/stocks_data/v1/web/header/volume_shakers?size=20', {
+      timeout:10000,
+      headers:{
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept':'application/json','Accept-Language':'en-IN,en;q=0.9',
+        'Origin':'https://groww.in','Referer':'https://groww.in/',
       },
     });
-
-    // Extract __NEXT_DATA__ — same as Python: soup.find("script", {"id": "__NEXT_DATA__"})
-    const match = r.data.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-    if (!match) throw new Error('__NEXT_DATA__ not found in page');
-
-    const nextData = JSON.parse(match[1]);
-    // Exact path: data["props"]["pageProps"]["mbgStocks"]
-    const mbgStocks = nextData?.props?.pageProps?.mbgStocks;
-    if (!Array.isArray(mbgStocks) || !mbgStocks.length) throw new Error('mbgStocks empty or missing');
-
-    const stocks = mbgStocks.map(s => {
-      const c  = s.company;
-      const st = s.stats;
-      const sym = c.nseScriptCode;
-
-      // Cache company info
-      companyNames[sym]  = c.companyShortName || c.companyName || sym;
-      growwSlugs[sym]    = c.searchId; // exact slug for Groww URL
-
-      return {
-        symbol:      sym,
-        companyName: c.companyName,
-        shortName:   c.companyShortName || c.companyName,
-        searchId:    c.searchId,        // e.g. "rm-drip-and-sprinklers-system-ltd"
-        isin:        c.isin,
-        haircut:     c.mtfHaircut,      // e.g. 22.56%
-        // Live stats from page load
-        ltp:         st.ltp,
-        high:        st.high,
-        low:         st.low,
-        prevClose:   st.close,          // yesterday's close
-        dayChange:   st.dayChange,
-        dayChangePct:st.dayChangePerc,
-        circuitLow:  st.lowPriceRange,
-        circuitHigh: st.highPriceRange,
-      };
-    });
-
-    console.log(`[MTF] ✅ ${stocks.length} MTF stocks scraped`);
-    console.log('[MTF] Stocks:', stocks.map(s=>`${s.symbol}(${s.dayChangePct.toFixed(1)}%)`).join(', '));
-    return stocks;
-
-  } catch(e) {
-    console.error('[MTF] Scrape failed:', e.message?.slice(0,80));
-    // Return cached if available
-    if (mtfStocks.length > 0) {
-      console.log('[MTF] Using cached stocks:', mtfStocks.length);
-      return mtfStocks;
+    const items = r.data?.items || r.data?.data || [];
+    const stocks = [];
+    for (const item of items) {
+      const sym = item.nseScriptCode || item.bseScriptCode || item.symbol;
+      if (!sym) continue;
+      if (item.companyShortName) companyNames[sym] = item.companyShortName;
+      else if (item.companyName) companyNames[sym] = item.companyName;
+      stocks.push({ symbol:sym, companyName:companyNames[sym]||sym,
+        slug:item.slug||sym.toLowerCase(), haircut:item.haircut||0 });
     }
-    // Last resort: fallback list
-    console.log('[MTF] Using BASE_STOCKS fallback');
-    return BASE_STOCKS.map(sym => ({
-      symbol:sym, companyName:companyNames[sym]||sym, shortName:companyNames[sym]||sym,
-      searchId:sym.toLowerCase(), isin:'', haircut:0,
-      ltp:0, high:0, low:0, prevClose:0, dayChange:0, dayChangePct:0,
-    }));
+    return stocks;
+  } catch(e) {
+    console.error('[MTF]', e.message?.slice(0,50));
+    return [];
   }
 }
 
-// Groww URL slug cache (populated from searchId in MTF scrape)
-const growwSlugs = {};
-
-// ONLY use MTF stocks — no other watchlist mixed in
-// These are the exact stocks Groww users are most actively trading in MTF mode
 function getAllSymbols() {
-  if (mtfStocks.length > 0) return mtfStocks.map(s => s.symbol);
-  return BASE_STOCKS; // fallback only
+  const mtfSyms = mtfStocks.map(s=>s.symbol);
+  return [...new Set([...mtfSyms, ...BASE_STOCKS])].slice(0,40);
 }
 
 function growwUrl(sym) {
-  const slug = growwSlugs[sym];
-  if (slug) return `https://groww.in/stocks/${slug}`;
-  // Try from mtfStocks
   const mtf = mtfStocks.find(s=>s.symbol===sym);
-  if (mtf?.searchId) return `https://groww.in/stocks/${mtf.searchId}`;
-  return `https://groww.in/stocks/${sym.toLowerCase()}`;
+  const slug = mtf?.slug || sym.toLowerCase();
+  return `https://groww.in/stocks/${slug}`;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -843,14 +770,10 @@ app.get('/api/status', (_, res) => {
   });
 });
 
-app.get('/api/quotes', (_, res) => {
-  maybeRefresh(); // trigger background refresh if stale
-  res.json({ quotes:dataStore.quotes, lastUpdated:dataStore.lastUpdated });
-});
+app.get('/api/quotes', (_, res) => res.json({ quotes:dataStore.quotes, lastUpdated:dataStore.lastUpdated }));
 
 // ★ MAIN PREDICTION ENDPOINT
 app.get('/api/mtf/live', (req, res) => {
-  maybeRefresh(); // trigger background refresh if stale
   const { action, limit=50 } = req.query;
   let preds = [...lockedPredictions];
 
@@ -882,19 +805,6 @@ app.get('/api/mtf/live', (req, res) => {
 app.get('/api/mtf/predictions', (req,res) =>
   res.redirect(`/api/mtf/live${req.query.action?'?action='+req.query.action:''}`)
 );
-
-// MTF stock list with predictions merged in
-app.get('/api/mtf/stocks', (_, res) => res.json({
-  stocks: mtfStocks.map(s => ({
-    ...s,
-    growwUrl: growwUrl(s.symbol),
-    companyName: companyNames[s.symbol] || s.companyName,
-    prediction: lockedPredictions.find(p=>p.symbol===s.symbol) || null,
-    liveQuote:  dataStore.quotes?.[s.symbol] || null,
-  })),
-  count:       mtfStocks.length,
-  lastFetched: dataStore.lastUpdated,
-}));
 
 // Full analysis for one stock
 app.get('/api/analyze/:sym', async (req,res) => {
@@ -945,70 +855,36 @@ app.post('/api/load-history', async(_,res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// CRON ENDPOINTS — called by Vercel crons (vercel.json)
-// Also work as manual triggers via GET /api/cron/*
-// On local: a simple setInterval polls mainRefresh every 3 min
+// CRON JOBS
 // ══════════════════════════════════════════════════════════════
-
-// 8:00 IST = 2:30 UTC — refresh MTF most-traded list
-app.get('/api/cron/mtf-refresh', async (_, res) => {
-  console.log('[Cron] mtf-refresh');
-  const fresh = await fetchGrowwMostTraded();
-  if (fresh.length) mtfStocks = fresh;
-  res.json({ ok: true, mtfStocks: mtfStocks.length, ts: istStr() });
-});
-
-// 8:30 IST = 3:00 UTC — load historical candles pre-market
-app.get('/api/cron/load-history', async (_, res) => {
-  console.log('[Cron] load-history');
+// Pre-market history load at 8:30 IST = 3:00 UTC
+cron.schedule('0 3 * * 1-5', async() => {
+  console.log('[Cron] 8:30 IST — pre-market history load');
   await loadAllHistory();
-  res.json({ ok: true, symbols: Object.keys(histCache).length, ts: istStr() });
-});
+}, { timezone:'UTC' });
 
 // 9:15 IST = 3:45 UTC — capture opening prices
-app.get('/api/cron/snapshot-915', async (_, res) => {
-  console.log('[Cron] snapshot-915');
+cron.schedule('45 3 * * 1-5', async() => {
+  console.log('[Cron] 9:15 IST — capturing opening snapshot');
   await capture915Snapshot();
-  res.json({ ok: true, snaps: Object.keys(openingSnaps).length, ts: istStr() });
-});
+}, { timezone:'UTC' });
 
-// 9:25 IST = 3:55 UTC — lock predictions from 10-min momentum
-app.get('/api/cron/snapshot-925', async (_, res) => {
-  console.log('[Cron] snapshot-925');
+// 9:25 IST = 3:55 UTC — lock predictions
+cron.schedule('55 3 * * 1-5', async() => {
+  console.log('[Cron] 9:25 IST — locking predictions');
   await capture925AndLock();
-  const buy  = lockedPredictions.filter(p => p.action === 'BUY').length;
-  const sell = lockedPredictions.filter(p => p.action === 'SELL').length;
-  res.json({ ok: true, total: lockedPredictions.length, buy, sell, ts: istStr() });
-});
+}, { timezone:'UTC' });
 
-// Every 3 min during market hours — update live prices + quotes
-app.get('/api/cron/refresh', async (_, res) => {
-  console.log('[Cron] refresh');
-  await mainRefresh();
-  res.json({ ok: true, quotes: Object.keys(dataStore.quotes).length,
-    active: lockedPredictions.filter(p => p.action !== 'HOLD').length, ts: istStr() });
-});
+// Every 3 min during market hours
+cron.schedule('*/3 3-10 * * 1-5', mainRefresh, { timezone:'UTC' });
 
-// 16:00 IST = 10:30 UTC — daily reset
-app.get('/api/cron/reset', (_, res) => {
-  console.log('[Cron] reset');
-  Object.keys(openingSnaps).forEach(k => delete openingSnaps[k]);
-  lockedPredictions = [];
-  snapshotStatus    = 'waiting';
-  console.log('[Cron] ✅ Daily reset — ready for next session');
-  res.json({ ok: true, ts: istStr() });
-});
-
-// ── LOCAL FALLBACK — simple interval when running with node server.js ──
-// Vercel uses the cron endpoints above; locally we poll every 3 min
-if (require.main === module) {
-  setInterval(async () => {
-    const { totalMins, day } = getIST();
-    if (day < 1 || day > 5) return;                          // skip weekends
-    if (totalMins < 9*60+15 || totalMins >= 15*60+30) return; // skip outside market
-    await mainRefresh();
-  }, 3 * 60 * 1000); // every 3 min
-}
+// Reset at 16:00 IST = 10:30 UTC
+cron.schedule('30 10 * * 1-5', () => {
+  Object.keys(openingSnaps).forEach(k=>delete openingSnaps[k]);
+  lockedPredictions=[];
+  snapshotStatus='waiting';
+  console.log('[Cron] Reset for next day');
+}, { timezone:'UTC' });
 
 // ══════════════════════════════════════════════════════════════
 // STARTUP
@@ -1016,73 +892,38 @@ if (require.main === module) {
 async function init() {
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║  ⚡ TradeBot v15 — Groww MTF Most-Traded Edition         ║
+║  ⚡ TradeBot v15 — Groww Trade API Edition               ║
 ║  http://localhost:${PORT}                                    ║
 ╠══════════════════════════════════════════════════════════╣
-║  Source:   groww.in/stocks/mtf/most-traded (live scrape) ║
+║  Data:     Groww API (official, real OHLC + historical)  ║
 ║  Engine:   9:15 vs 9:25 momentum + 7 technical factors   ║
 ║  Targets:  Pivot-adjusted, R:R based stop loss           ║
-║  Refresh:  Every 3 min (prices) + 30 min (MTF list)      ║
+║  Links:    Groww MIS direct buy/sell                     ║
 ╚══════════════════════════════════════════════════════════╝`);
 
-  // Step 1 — Scrape Groww MTF most-traded list
-  console.log('\n[Init] 🔍 Scraping Groww MTF most-traded list...');
+  // Load MTF stocks
+  console.log('[Init] Loading Groww most-traded...');
   mtfStocks = await fetchGrowwMostTraded();
+  console.log(`[Init] ${mtfStocks.length} MTF stocks, ${getAllSymbols().length} total watchlist`);
 
-  if (mtfStocks.length) {
-    console.log(`[Init] ✅ ${mtfStocks.length} MTF stocks loaded:`);
-    // Print table like the Python script
-    console.log(`  ${'Company'.padEnd(32)} ${'NSE'.padEnd(12)} ${'LTP'.padStart(10)} ${'Chg%'.padStart(8)} ${'Haircut'.padStart(9)}`);
-    console.log('  ' + '─'.repeat(80));
-    mtfStocks.forEach(s => {
-      const chg = (s.dayChangePct||0).toFixed(2);
-      const sign = s.dayChangePct>=0?'+':'';
-      console.log(`  ${(s.companyName||s.symbol).slice(0,32).padEnd(32)} ${s.symbol.padEnd(12)} ₹${String((s.ltp||0).toFixed(1)).padStart(9)} ${(sign+chg+'%').padStart(8)} ${((s.haircut||0).toFixed(1)+'%').padStart(9)}`);
-    });
-  } else {
-    console.log('[Init] ⚠️  MTF scrape failed — using BASE_STOCKS fallback');
-  }
-
-  // Step 2 — Load 5-day historical candles for all MTF stocks
-  console.log('\n[Init] 📊 Loading historical candles...');
+  // Load history
   await loadAllHistory();
 
-  // Step 3 — Run initial data refresh + generate predictions if market is open
+  // Check if market is currently open
   const { totalMins, day } = getIST();
   const phase = marketPhase();
-  console.log(`\n[Init] 🕐 ${istStr()} | Phase: ${phase}`);
+  console.log(`[Init] Phase: ${phase}`);
 
-  await mainRefresh();
-
-  // Step 4 — If already past 9:25, generate fallback predictions immediately
-  if (day>=1&&day<=5&&totalMins>=9*60+25&&totalMins<15*60+30 && !lockedPredictions.length) {
-    console.log('[Init] ⚡ Market open past 9:25 — generating fallback predictions from open prices');
-    generateFallbackFromLive(dataStore.quotes);
+  if (day>=1&&day<=5&&totalMins>=9*60+25&&totalMins<15*60+30) {
+    // Market is open past 9:25 — run full refresh + fallback
+    console.log('[Init] Market open past 9:25 — running immediate refresh + fallback predictions');
+    await mainRefresh();
+  } else {
+    await mainRefresh();
   }
 
-  const active = lockedPredictions.filter(p=>p.action!=='HOLD').length;
-  console.log(`\n╔══════════════════════════════════════════════════════════╗`);
-  console.log(`║  ✅ READY at ${istStr()}                              ║`);
-  console.log(`║  Phase: ${phase.padEnd(20)} MTF Stocks: ${mtfStocks.length}           ║`);
-  console.log(`║  Active Predictions: ${String(active).padEnd(4)} (${lockedPredictions.filter(p=>p.action==='BUY').length} BUY / ${lockedPredictions.filter(p=>p.action==='SELL').length} SELL)         ║`);
-  console.log(`║  Dashboard: http://localhost:${PORT}                         ║`);
-  console.log(`╚══════════════════════════════════════════════════════════╝\n`);
+  console.log(`\n[Ready] ✅ ${istStr()} | ${phase} | ${lockedPredictions.filter(p=>p.action!=='HOLD').length} active predictions`);
 }
-
-// ══════════════════════════════════════════════════════════════
-// START — local dev OR Vercel serverless
-// ══════════════════════════════════════════════════════════════
-
-// Vercel serverless: lazy-init on first request
-let _initialized = false;
-const _originalHandle = app.handle.bind(app);
-app.handle = async (req, res, next) => {
-  if (!_initialized) {
-    _initialized = true;
-    try { await init(); } catch(e) { console.error('[Init Error]', e.message); }
-  }
-  _originalHandle(req, res, next);
-};
 
 // Auto-init on first request (Vercel serverless)
 let initialized = false;
