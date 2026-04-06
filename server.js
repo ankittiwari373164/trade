@@ -1084,7 +1084,17 @@ app.handle = async (req, res, next) => {
   _originalHandle(req, res, next);
 };
 
-// Local: listen immediately
+// Auto-init on first request (Vercel serverless)
+let initialized = false;
+const originalHandler = app.handle.bind(app);
+app.handle = async (req, res, next) => {
+  if (!initialized) {
+    initialized = true;
+    try { await init(); } catch(e) { console.error('[Init]', e.message); }
+  }
+  originalHandler(req, res, next);
+};
+
 if (require.main === module) {
   app.listen(PORT, init);
 }
