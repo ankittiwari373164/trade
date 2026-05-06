@@ -229,10 +229,13 @@ header{position:sticky;top:0;z-index:100;display:flex;align-items:center;gap:12p
   </div>
 
   <div class="filter-row">
-    <span id="predFilters" style="display:flex;gap:5px">
+    <span id="predFilters" style="display:flex;gap:5px;flex-wrap:wrap">
       <span class="fchip active" onclick="filterP('ALL',this)">ALL</span>
       <span class="fchip g"      onclick="filterP('BUY',this)">📈 BUY</span>
       <span class="fchip r"      onclick="filterP('SELL',this)">📉 SELL</span>
+      <span class="fchip"        onclick="filterP('MOST_BOUGHT',this)" style="border-color:var(--groww);color:var(--groww)">⭐ MOST BOUGHT</span>
+      <span class="fchip"        onclick="filterP('INTRADAY',this)"    style="border-color:var(--yellow);color:var(--yellow)">⚡ TOP INTRADAY</span>
+      <span class="fchip"        onclick="filterP('VOLUME',this)"      style="border-color:var(--blue);color:var(--blue)">🔊 TOP VOLUME</span>
     </span>
     <span id="predCount" style="font-size:9px;color:var(--muted);margin-left:auto">—</span>
   </div>
@@ -379,6 +382,9 @@ function renderPreds() {
   let list = [...allPreds];
   if (predFilter==='BUY')  list=list.filter(p=>p.action==='BUY');
   if (predFilter==='SELL') list=list.filter(p=>p.action==='SELL');
+  if (predFilter==='MOST_BOUGHT') list=list.filter(p=>(p.tags||[]).some(t=>t.includes('MOST BOUGHT')));
+  if (predFilter==='INTRADAY')    list=list.filter(p=>(p.tags||[]).some(t=>t.includes('INTRADAY')));
+  if (predFilter==='VOLUME')      list=list.filter(p=>(p.tags||[]).some(t=>t.includes('VOLUME')));
 
   if (!list.length) {
     el.innerHTML=`<div class="empty" style="grid-column:1/-1">
@@ -422,19 +428,35 @@ function renderPreds() {
     // Indicator chips
     const rsiCol = (p.rsi||50)>65?'var(--red)':(p.rsi||50)<35?'var(--green)':'var(--yellow)';
     const emaCol = p.emaStack==='BULL'?'var(--green)':p.emaStack==='BEAR'?'var(--red)':'var(--muted)';
+    const macdCol = p.macd?.histogram>0?'var(--green)':p.macd?.histogram<0?'var(--red)':'var(--muted)';
+    const adxCol = (p.adx||0)>=25?'var(--green)':(p.adx||0)>=18?'var(--yellow)':'var(--muted)';
+    const alphaCol = (p.alpha||0)>0?'var(--green)':(p.alpha||0)<0?'var(--red)':'var(--muted)';
     const indHtml = `
       <div class="pc-indicators">
         ${p.rsi?`<span class="ind-chip" style="color:${rsiCol}">RSI ${p.rsi}</span>`:''}
         ${p.vwap?`<span class="ind-chip" style="color:${p.aboveVWAP?'var(--green)':'var(--red)'}">VWAP ${p.aboveVWAP?'▲':'▼'} ₹${p.vwap}</span>`:''}
         ${p.emaStack?`<span class="ind-chip" style="color:${emaCol}">EMA ${p.emaStack}</span>`:''}
+        ${p.macd?`<span class="ind-chip" style="color:${macdCol}">MACD ${p.macd.histogram>=0?'+':''}${p.macd.histogram}</span>`:''}
+        ${p.adx?`<span class="ind-chip" style="color:${adxCol}">ADX ${p.adx}</span>`:''}
+        ${p.alpha!=null?`<span class="ind-chip" style="color:${alphaCol}" title="vs NIFTY">α ${p.alpha>=0?'+':''}${p.alpha}%</span>`:''}
         ${p.dev10!=null?`<span class="ind-chip">10m ${p.dev10>=0?'+':''}${p.dev10}%</span>`:''}
+        ${p.relVol?`<span class="ind-chip" style="color:${p.relVol>=1.5?'var(--green)':p.relVol<0.6?'var(--muted)':'var(--text)'}">Vol ${p.relVol}×</span>`:''}
         ${p.atr?`<span class="ind-chip">ATR ₹${p.atr}</span>`:''}
       </div>`;
+
+    // Tag pills (MOST BOUGHT / TOP INTRADAY / TOP VOLUME / TOP GAINER)
+    const tagPills = (p.tags||[]).map(t => {
+      const c = t.includes('MOST BOUGHT') ? 'var(--groww)'
+              : t.includes('INTRADAY')    ? 'var(--yellow)'
+              : t.includes('VOLUME')      ? 'var(--blue)'
+              : t.includes('GAINER')      ? 'var(--green)' : 'var(--muted)';
+      return `<span style="display:inline-block;padding:1px 6px;border-radius:8px;font-size:8px;font-weight:700;letter-spacing:.3px;background:rgba(255,255,255,.04);border:1px solid ${c};color:${c};margin-left:4px;vertical-align:middle">${t}</span>`;
+    }).join('');
 
     return `<div class="pred-card ${p.action}" onclick="selectSym('${p.symbol}')">
       <div class="pc-top">
         <div>
-          <div class="pc-sym">${p.symbol} <span class="badge badge-${p.action}" style="vertical-align:middle">${p.action}</span></div>
+          <div class="pc-sym">${p.symbol} <span class="badge badge-${p.action}" style="vertical-align:middle">${p.action}</span>${tagPills}</div>
           <div class="pc-name">${p.name||''}</div>
           <div class="pc-open">
             Open ₹${p.open915Price||0}
