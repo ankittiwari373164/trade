@@ -1151,7 +1151,34 @@ async function mainRefresh() {
 // ══════════════════════════════════════════════════════════════
 // API ENDPOINTS
 // ══════════════════════════════════════════════════════════════
+
+// ──────────────────────────────────────────────────────────────
+// Lazy auto-refresh — Vercel Hobby cron limit replacement
+// Triggers mainRefresh() at most once per AUTO_REFRESH_MS during
+// market hours, on any read request from the frontend. The frontend's
+// 60s poll loop then keeps everything live without needing a cron.
+// ──────────────────────────────────────────────────────────────
+const AUTO_REFRESH_MS = 60_000;
+let lastAutoRefresh = 0;
+let autoRefreshInFlight = null;
+function maybeAutoRefresh() {
+  // Only during market hours (9:25 IST → 15:30 IST), otherwise data is static
+  const { totalMins, day } = getIST();
+  const inMarket = day >= 1 && day <= 5 && totalMins >= 9*60+25 && totalMins < 15*60+30;
+  if (!inMarket) return;
+  const now = Date.now();
+  if (now - lastAutoRefresh < AUTO_REFRESH_MS) return;
+  if (autoRefreshInFlight) return;
+  lastAutoRefresh = now;
+  // Fire and forget — the response we're returning uses whatever's already cached;
+  // the next poll will see the freshly refreshed data.
+  autoRefreshInFlight = mainRefresh()
+    .catch(e => console.error('[AutoRefresh]', e.message))
+    .finally(() => { autoRefreshInFlight = null; });
+}
+
 app.get('/api/status', (_, res) => {
+  maybeAutoRefresh();
   const ph = marketPhase();
   const { h, m } = getIST();
   const pad = n => String(n).padStart(2,'0');
@@ -1170,16 +1197,19 @@ app.get('/api/status', (_, res) => {
     },
     niftyChange,
     lastUpdated: dataStore.lastUpdated,
-    version: '16.0.0',
+    autoRefreshAge: lastAutoRefresh ? Math.round((Date.now()-lastAutoRefresh)/1000) : null,
+    version: '16.1.0',
   });
 });
 
-app.get('/api/quotes', (_, res) =>
-  res.json({ quotes: dataStore.quotes, lastUpdated: dataStore.lastUpdated })
-);
+app.get('/api/quotes', (_, res) => {
+  maybeAutoRefresh();
+  res.json({ quotes: dataStore.quotes, lastUpdated: dataStore.lastUpdated });
+});
 
 // MAIN PREDICTION ENDPOINT
 app.get('/api/mtf/live', (req, res) => {
+  maybeAutoRefresh();
   const { action, limit = 50, tag, includeHold = '0' } = req.query;
   let preds = [...lockedPredictions];
 
@@ -1389,7 +1419,7 @@ async function init() {
   initInFlight = (async () => {
     console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║  ⚡ TradeBot v16 — Groww Trade API (Hardened)            ║
+║  ⚡ TradeBot v16.1 — Groww (Vercel Hobby compatible)     ║
 ║  http://localhost:${PORT}                                    ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Data:    Groww Trade API + discovery filters            ║
