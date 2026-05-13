@@ -531,7 +531,7 @@ function getAllSymbols() {
     ...discoveryStocks.gainers.map(s => s.symbol),
     ...BASE_STOCKS,
   ]);
-  return [...all].slice(0, 50); // hard cap to keep API usage sane
+  return [...all].slice(0, 25); // cap at 25 — keeps single-invocation API calls under Vercel 10s limit
 }
 
 function growwUrl(sym) {
@@ -576,6 +576,99 @@ async function loadAllHistory() {
     if (i + 4 < syms.length) await sleep(350);
   }
   console.log(`[Hist] ✅ Loaded ${Object.keys(histCache).length} stocks`);
+}
+
+// ──────────────────────────────────────────────────────────────
+// ON-DEMAND PER-SYMBOL PROCESSING
+// Each call does ~3-5 API calls and takes ~2-3 seconds — safe for
+// Vercel's 10s function timeout when called from a request handler.
+// ──────────────────────────────────────────────────────────────
+async function processSymbol(sym) {
+  try {
+    if (!histCache[sym]) histCache[sym] = {};
+    const c = histCache[sym];
+    const now = Date.now();
+    const m5Stale = !c.m5Loaded || (now - c.m5Loaded) > 60_000;
+    const needDaily = !c.daily?.length;
+    const needM1 = !openingSnaps[sym]?.t925 && isPostOpen();
+
+    // Parallelise: daily history + 5-min candles + 1-min candles + live quote
+    // This brings per-symbol time from ~3s sequential to ~1s parallel.
+    const [daily, m5, m1, quote] = await Promise.all([
+      needDaily       ? fetchDailyHistory(sym, 60) : Promise.resolve(c.daily),
+      (m5Stale && isOpen()) ? fetchToday5min(sym) : Promise.resolve(c.m5 || []),
+      needM1          ? fetchToday1min(sym) : Promise.resolve(null),
+      growwQuote(sym).catch(() => null),
+    ]);
+
+    if (daily?.length) c.daily = daily;
+    if (m5?.length) { c.m5 = m5; c.m5Loaded = now; }
+    if (quote) liveQuotes[sym] = quote;
+
+    // Reconstruct t915/t925 from 1-min candles
+    if (needM1 && m1 && m1.length > 0) {
+      const t915 = m1[0][1];
+      const t925 = m1[Math.min(m1.length - 1, 9)][4];
+      openingSnaps[sym] = { t915, t925, open: t915 };
+    }
+
+    if (openingSnaps[sym]?.t915 > 0 && openingSnaps[sym]?.t925 != null) {
+      const pred = buildPrediction(sym, openingSnaps[sym], liveQuotes[sym] || null, c);
+      lockedPredictions = lockedPredictions.filter(p => p.symbol !== sym);
+      lockedPredictions.push(pred);
+      return pred;
+    }
+    return null;
+  } catch (e) {
+    console.error(`[processSymbol] ${sym}: ${e.message?.slice(0,80)}`);
+    return null;
+  }
+}
+
+function isPostOpen() {
+  const { totalMins, day } = getIST();
+  return day >= 1 && day <= 5 && totalMins >= 9*60+25 && totalMins < 15*60+30;
+}
+
+// Background processor — processes symbols one at a time without blocking responses.
+// Started by /api/mtf/live when there are unprocessed symbols.
+let bgRunning = false;
+let bgQueue = [];
+
+async function startBackgroundProcessing() {
+  if (bgRunning) return;
+  bgRunning = true;
+
+  try {
+    while (bgQueue.length > 0) {
+      const sym = bgQueue.shift();
+      await processSymbol(sym);
+      // Persist progress every few symbols
+      if (bgQueue.length % 3 === 0) persist();
+      // Small gap to be polite to the API
+      await sleep(150);
+    }
+  } catch (e) {
+    console.error('[BG]', e.message);
+  } finally {
+    persist();
+    bgRunning = false;
+  }
+}
+
+function enqueueUnprocessedSymbols() {
+  const syms = getAllSymbols();
+  const have = new Set(lockedPredictions.map(p => p.symbol));
+  const stale = isPostOpen()
+    ? new Set(lockedPredictions
+        .filter(p => !p.currentPrice || Date.now() - new Date(p.lockedAt).getTime() > 5*60_000)
+        .map(p => p.symbol))
+    : new Set();
+  const needed = syms.filter(s => !have.has(s) || stale.has(s));
+  // De-dupe with existing queue
+  const queueSet = new Set(bgQueue);
+  for (const s of needed) if (!queueSet.has(s)) bgQueue.push(s);
+  return needed.length;
 }
 
 async function loadDiscovery() {
@@ -829,13 +922,20 @@ function buildPrediction(sym, snap, liveQ, hist) {
   // Confidence: dominance × conflict-penalty × trend-quality
   const dominance = Math.abs(bullPct - 0.5) * 200;            // 0–100
   const conflictPenalty = total > 0 ? 1 - Math.min(bull, bear) / total : 1; // 1=clean, 0=conflicted
-  const trendBonus = Math.min(1, adx / 30) * 0.15 + 0.85;     // 0.85–1.0
+  const trendBonus = adx > 0 ? Math.min(1, adx / 30) * 0.15 + 0.85 : 0.92;  // 0.85–1.0; neutral when ADX unavailable
   const confidence = Math.min(95, Math.round(dominance * conflictPenalty * trendBonus));
 
   let action = 'HOLD';
-  const adxOk = adx >= 18 || Math.abs(dev10) >= 0.6;
-  if (margin >=  18 && bullPct >= 0.56 && adxOk) action = 'BUY';
-  if (margin <= -18 && bullPct <= 0.44 && adxOk) action = 'SELL';
+  // Gate: ADX>=18 confirms trend strength. But ADX requires daily history;
+  // when daily isn't loaded yet (e.g. fresh Vercel container right after 9:25),
+  // adx=0 and we must fall back to pure momentum criteria, otherwise EVERYTHING
+  // becomes HOLD and the user sees an empty dashboard.
+  const haveDailyHistory = daily.length >= 30;
+  const adxOk = haveDailyHistory
+    ? (adx >= 18 || Math.abs(dev10) >= 0.6)
+    : (Math.abs(dev10) >= 0.4);  // Relaxed criterion until daily loads
+  if (margin >=  15 && bullPct >= 0.55 && adxOk) action = 'BUY';
+  if (margin <= -15 && bullPct <= 0.45 && adxOk) action = 'SELL';
 
   // ── Targets & stops (ATR-aware, R:R-controlled) ──
   const absMove = Math.abs(dev10);
@@ -979,40 +1079,26 @@ async function capture915Snapshot() {
 }
 
 async function capture925AndLock() {
-  console.log('\n[9:25] 📸 Capturing 10-min prices + generating predictions...');
+  console.log('\n[9:25] 📸 Reconstructing t915/t925 + generating predictions...');
+
+  // Make sure discovery is loaded (cron runs in fresh container)
+  if (!discoveryStocks.mostBought.length) {
+    await loadDiscovery().catch(() => {});
+  }
   const syms = getAllSymbols();
+  console.log(`[9:25] Processing ${syms.length} symbols`);
 
   // Refresh NIFTY change for index-correlation factor
-  niftyChange = await fetchNiftyChange();
-  console.log(`[9:25] NIFTY change: ${niftyChange}%`);
+  niftyChange = await fetchNiftyChange().catch(() => 0);
 
-  // Capture 9:25 LTP
-  const ltpMap = await growwLTP(syms);
-  for (const sym of syms) {
-    const ltp = ltpMap[`NSE_${sym}`];
-    if (ltp != null && openingSnaps[sym])      openingSnaps[sym].t925 = ltp;
-    else if (!openingSnaps[sym] && ltp != null) openingSnaps[sym] = { t915: ltp, t925: ltp, open: ltp };
-  }
-
-  // Refresh 5-min candles for ALL symbols (we need VWAP/RSI)
+  // Process symbols in parallel batches — each processSymbol() does
+  // daily + 5min + 1min + quote fetches in parallel (so ~1-2s each).
+  // 4-in-flight × ~2s = 25 symbols in ~12-15s. Vercel cron has 60s.
   for (let i = 0; i < syms.length; i += 4) {
     const batch = syms.slice(i, i + 4);
-    await Promise.all(batch.map(async s => {
-      if (!histCache[s]) histCache[s] = {};
-      histCache[s].m5 = await fetchToday5min(s);
-    }));
-    if (i + 4 < syms.length) await sleep(300);
+    await Promise.all(batch.map(s => processSymbol(s)));
+    if (i + 4 < syms.length) await sleep(150);
   }
-
-  // Fetch full quotes (depth) — top 30 by volume signal interest
-  const top30 = syms.slice(0, 30);
-  await fetchFullQuotes(top30, 3);
-
-  // Build predictions
-  lockedPredictions = Object.entries(openingSnaps)
-    .filter(([, snap]) => snap.t915 > 0 && snap.t925 != null)
-    .map(([sym, snap]) => buildPrediction(sym, snap, liveQuotes[sym] || null, histCache[sym] || {}))
-    .filter(Boolean);
 
   snapshotStatus = 'locked';
   const buy  = lockedPredictions.filter(p => p.action === 'BUY').length;
@@ -1154,27 +1240,30 @@ async function mainRefresh() {
 
 // ──────────────────────────────────────────────────────────────
 // Lazy auto-refresh — Vercel Hobby cron limit replacement
-// Triggers mainRefresh() at most once per AUTO_REFRESH_MS during
-// market hours, on any read request from the frontend. The frontend's
-// 60s poll loop then keeps everything live without needing a cron.
+// On every read request from the frontend:
+//   • If market is open and we have unprocessed symbols, kick off
+//     a background processor (fire-and-forget). The first request
+//     returns whatever's cached; subsequent polls see growing results.
+//   • If predictions exist but are stale (>60s), refresh prices in
+//     the background.
+// Single-flight: only one background process at a time.
 // ──────────────────────────────────────────────────────────────
-const AUTO_REFRESH_MS = 60_000;
-let lastAutoRefresh = 0;
-let autoRefreshInFlight = null;
+let lastPriceRefresh = 0;
 function maybeAutoRefresh() {
-  // Only during market hours (9:25 IST → 15:30 IST), otherwise data is static
-  const { totalMins, day } = getIST();
-  const inMarket = day >= 1 && day <= 5 && totalMins >= 9*60+25 && totalMins < 15*60+30;
-  if (!inMarket) return;
+  if (!isPostOpen()) return;
+
+  // Queue any unprocessed symbols and start background work
+  const queued = enqueueUnprocessedSymbols();
+  if (queued > 0 && !bgRunning) {
+    startBackgroundProcessing().catch(e => console.error('[BG kickoff]', e.message));
+  }
+
+  // Light price-only refresh of existing predictions every 60s
   const now = Date.now();
-  if (now - lastAutoRefresh < AUTO_REFRESH_MS) return;
-  if (autoRefreshInFlight) return;
-  lastAutoRefresh = now;
-  // Fire and forget — the response we're returning uses whatever's already cached;
-  // the next poll will see the freshly refreshed data.
-  autoRefreshInFlight = mainRefresh()
-    .catch(e => console.error('[AutoRefresh]', e.message))
-    .finally(() => { autoRefreshInFlight = null; });
+  if (lockedPredictions.length > 0 && now - lastPriceRefresh > 60_000 && !bgRunning) {
+    lastPriceRefresh = now;
+    updateLivePrices().catch(e => console.error('[PriceRefresh]', e.message));
+  }
 }
 
 app.get('/api/status', (_, res) => {
@@ -1197,8 +1286,8 @@ app.get('/api/status', (_, res) => {
     },
     niftyChange,
     lastUpdated: dataStore.lastUpdated,
-    autoRefreshAge: lastAutoRefresh ? Math.round((Date.now()-lastAutoRefresh)/1000) : null,
-    version: '16.1.0',
+    autoRefreshAge: lastPriceRefresh ? Math.round((Date.now()-lastPriceRefresh)/1000) : null,
+    version: '16.2.0',
   });
 });
 
@@ -1207,12 +1296,57 @@ app.get('/api/quotes', (_, res) => {
   res.json({ quotes: dataStore.quotes, lastUpdated: dataStore.lastUpdated });
 });
 
-// MAIN PREDICTION ENDPOINT
-app.get('/api/mtf/live', (req, res) => {
-  maybeAutoRefresh();
-  const { action, limit = 50, tag, includeHold = '0' } = req.query;
-  let preds = [...lockedPredictions];
+// Synchronously bootstrap N predictions when state is empty past 9:25.
+// Runs within the request's compute time so the response can include predictions.
+// Limited to 8 priority symbols to stay under Vercel's 10s function timeout.
+async function bootstrapPriorityPredictions(maxSymbols = 8, maxTimeMs = 7000) {
+  if (!isPostOpen()) return 0;
+  // Make sure discovery is loaded for tagging (one quick call)
+  if (!discoveryStocks.mostBought.length && !discoveryStocks.intraday.length) {
+    await loadDiscovery().catch(() => {});
+  }
+  // Priority order: most-bought first, then intraday, then by-volume, then BASE_STOCKS
+  const priority = [
+    ...discoveryStocks.mostBought.map(s => s.symbol),
+    ...discoveryStocks.intraday.map(s => s.symbol),
+    ...discoveryStocks.byVolume.map(s => s.symbol),
+    ...BASE_STOCKS,
+  ];
+  const seen = new Set();
+  const unique = priority.filter(s => !seen.has(s) && seen.add(s));
+  const done = new Set(lockedPredictions.map(p => p.symbol));
+  const todo = unique.filter(s => !done.has(s)).slice(0, maxSymbols);
 
+  const start = Date.now();
+  // Process in parallel batches of 4 (Promise.all)
+  let processed = 0;
+  for (let i = 0; i < todo.length; i += 4) {
+    if (Date.now() - start > maxTimeMs) break;
+    const batch = todo.slice(i, i + 4);
+    const results = await Promise.all(batch.map(s => processSymbol(s)));
+    processed += results.filter(Boolean).length;
+  }
+  return processed;
+}
+
+// MAIN PREDICTION ENDPOINT
+app.get('/api/mtf/live', async (req, res) => {
+  const { action, limit = 50, tag, includeHold = '0' } = req.query;
+
+  // Synchronous bootstrap: if past 9:25 and we have no predictions, build a batch NOW
+  // so the user sees predictions on the FIRST request, not after polling for 30s.
+  if (isPostOpen() && lockedPredictions.length === 0) {
+    try {
+      await bootstrapPriorityPredictions(8, 7000);
+    } catch (e) {
+      console.error('[Bootstrap]', e.message);
+    }
+  }
+
+  // Trigger background processing for the rest (fire-and-forget)
+  maybeAutoRefresh();
+
+  let preds = [...lockedPredictions];
   if (action) preds = preds.filter(p => p.action === action.toUpperCase());
   else if (includeHold !== '1') preds = preds.filter(p => p.action !== 'HOLD');
 
@@ -1231,6 +1365,10 @@ app.get('/api/mtf/live', (req, res) => {
   });
   preds = preds.slice(0, parseInt(limit));
 
+  // Tell the frontend whether we're still building so it polls faster
+  const watchlistSize = getAllSymbols().length;
+  const building = isPostOpen() && lockedPredictions.length < watchlistSize;
+
   res.json({
     predictions: preds,
     summary: {
@@ -1241,13 +1379,19 @@ app.get('/api/mtf/live', (req, res) => {
       targetsHit: preds.filter(p => p.currentStatus?.includes('TARGET HIT')).length,
       onTrack:    preds.filter(p => p.currentStatus?.includes('ON TRACK')).length,
     },
+    building,
+    progress: { done: lockedPredictions.length, total: watchlistSize },
     snapshotStatus, phase: marketPhase(), niftyChange,
     updatedAt: new Date().toISOString(),
   });
 });
 
 // Most-bought-only endpoint (★ matches user request)
-app.get('/api/mtf/most-bought', (_, res) => {
+app.get('/api/mtf/most-bought', async (_, res) => {
+  if (isPostOpen() && lockedPredictions.length === 0) {
+    await bootstrapPriorityPredictions(8, 7000).catch(()=>{});
+  }
+  maybeAutoRefresh();
   const set = new Set(discoveryStocks.mostBought.map(s => s.symbol));
   const preds = lockedPredictions
     .filter(p => set.has(p.symbol) && p.action !== 'HOLD')
@@ -1256,7 +1400,11 @@ app.get('/api/mtf/most-bought', (_, res) => {
 });
 
 // Top intraday endpoint (★ matches user request)
-app.get('/api/mtf/intraday', (_, res) => {
+app.get('/api/mtf/intraday', async (_, res) => {
+  if (isPostOpen() && lockedPredictions.length === 0) {
+    await bootstrapPriorityPredictions(8, 7000).catch(()=>{});
+  }
+  maybeAutoRefresh();
   const set = new Set(discoveryStocks.intraday.map(s => s.symbol));
   const preds = lockedPredictions
     .filter(p => set.has(p.symbol) && p.action !== 'HOLD')
@@ -1419,7 +1567,7 @@ async function init() {
   initInFlight = (async () => {
     console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║  ⚡ TradeBot v16.1 — Groww (Vercel Hobby compatible)     ║
+║  ⚡ TradeBot v16.2 — Synchronous bootstrap edition       ║
 ║  http://localhost:${PORT}                                    ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Data:    Groww Trade API + discovery filters            ║

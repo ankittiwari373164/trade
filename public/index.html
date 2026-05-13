@@ -308,7 +308,12 @@ async function fetchPreds() {
     document.getElementById('sTrack').textContent= s.onTrack || 0;
     document.getElementById('sStatus').textContent = d.snapshotStatus || '—';
     document.getElementById('sPhase').textContent  = d.phase || '—';
-    document.getElementById('predCount').textContent = `${allPreds.length} total`;
+    const buildingTxt = d.building && d.progress
+      ? ` · building ${d.progress.done}/${d.progress.total}…`
+      : '';
+    document.getElementById('predCount').textContent = `${allPreds.length} total${buildingTxt}`;
+    // Expose building flag for adaptive polling
+    window.__building = !!d.building;
     renderPreds();
     buildSymBtns();
   } catch(e) { console.error('Preds:', e.message); }
@@ -665,7 +670,13 @@ window.addEventListener('resize', () => {
   if(chart&&w) chart.resize(w.clientWidth,320);
 });
 refreshAll();
-setInterval(refreshAll, 60000);
+// Adaptive polling: poll every 5s while the server is still building predictions
+// (the "building" flag from /api/mtf/live), then back off to 60s once stable.
+function scheduleNext() {
+  const delay = window.__building ? 5000 : 60000;
+  setTimeout(async () => { await refreshAll(); scheduleNext(); }, delay);
+}
+scheduleNext();
 </script>
 </body>
 </html>
